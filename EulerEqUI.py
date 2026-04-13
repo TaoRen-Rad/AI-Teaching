@@ -1,383 +1,589 @@
+from __future__ import annotations
+
+import contextlib
+from dataclasses import asdict, dataclass
+from io import BytesIO, StringIO
+from typing import Any
+
+import matplotlib.cm as cm
 import numpy as np
 import streamlit as st
-import matplotlib.pyplot as plt
-from matplotlib import colormaps
-from matplotlib.lines import Line2D
+from matplotlib.colors import Normalize
+from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
-from dataclasses import dataclass
+
+from lid_driven_cavity_streamfunction_vorticity_animation import (
+    FlowSnapshot,
+    LidDrivenCavitySolver,
+    SolverConfig,
+)
+from lid_driven_cavity_streamfunction_vorticity_thermal_animation import (
+    LidDrivenCavityThermalSolver,
+    ThermalFlowSnapshot,
+    ThermalSolverConfig,
+)
 
 
 PALETTE = {
     "paper": "#f8f6f2",
     "panel": "#ffffff",
-    "sidebar": "#f1ebdf",
-    "ink": "#1f2937",
-    "muted": "#6b7280",
-    "grid": "#d8dee6",
+    "ink": "#132238",
+    "muted": "#5b6b82",
     "accent": "#0f766e",
+    "accent_soft": "#d8ece8",
+    "secondary": "#c2410c",
+    "grid": "#dbe5f0",
+}
+
+DEFAULTS: dict[str, Any] = {
+    "mode": "flow",
+    "nx": 101,
+    "ny": 101,
+    "reynolds": 400.0,
+    "lid_velocity": 1.0,
+    "final_time": 10.0,
+    "cfl_number": 0.50,
+    "frame_stride": 100,
+    "poisson_max_iter": 60,
+    "thermal_diffusivity": 5.0e-4,
+    "thermal_conductivity": 1.0,
+    "initial_temperature": 300.0,
+    "top_temperature": 300.0,
+    "left_temperature": 300.0,
+    "right_temperature": 300.0,
+    "bottom_bc_mode": "fixed_temperature",
+    "bottom_temperature": 320.0,
+    "bottom_heat_flux": 0.0,
+    "volumetric_heat_source": 0.0,
+    "source_x_min": 0.40,
+    "source_x_max": 0.60,
+    "source_y_min": 0.20,
+    "source_y_max": 0.40,
 }
 
 PRESETS = {
-    "Triangular pulse (analytic reference)": {
-        "expression": "np.where((x >= -1.0) & (x < 0.0), 1.0 + x, np.where((x >= 0.0) & (x <= 1.0), 1.0 - x, 0.0))",
-        "description": "Classical compact triangular pulse. Uses the analytic reference solution when the expression is unchanged.",
-        "reference_mode": "analytic_triangle",
+    "Classical Laminar Cavity": {
+        "description": "Baseline lid-driven cavity benchmark for streamlines, streamfunction, vorticity, and pressure recovery.",
+        "mode": "flow",
     },
-    "Square pulse": {
-        "expression": "np.where((x >= -1.0) & (x <= 1.0), 1.0, 0.0)",
-        "description": "A discontinuous top-hat profile, useful for observing shock formation and numerical diffusion.",
-        "reference_mode": "fine_grid",
+    "Heated Bottom Wall": {
+        "description": "Adds the transient temperature equation with a hotter bottom wall so advection and diffusion are easy to compare.",
+        "mode": "thermal",
     },
-    "Gaussian bump": {
-        "expression": "np.exp(-x**2)",
-        "description": "A smooth bump that steepens over time and later develops a shock-like front.",
-        "reference_mode": "fine_grid",
+    "Internal Heat Source": {
+        "description": "Uses the thermal solver with an interior source region to show how the flow convects a thermal plume.",
+        "mode": "thermal",
+        "final_time": 8.0,
+        "bottom_temperature": 300.0,
+        "volumetric_heat_source": 5.0e5,
     },
-    "Cosine hat": {
-        "expression": "np.where(np.abs(x) <= 2.0, 0.5 * (1.0 + np.cos(np.pi * x / 2.0)), 0.0)",
-        "description": "A smooth compactly supported initial profile with gradual steepening.",
-        "reference_mode": "fine_grid",
-    },
-    "Double bump": {
-        "expression": "0.8*np.exp(-(x+1.3)**2/0.25) + 0.55*np.exp(-(x-0.9)**2/0.16)",
-        "description": "Two interacting positive waves. This is useful for testing more complex nonlinear interactions.",
-        "reference_mode": "fine_grid",
-    },
-    "Custom expression": {
-        "expression": "np.where((x >= 0.0), 1.0, 0.0)",
-        "description": "Edit the expression freely using x and NumPy functions such as np.where, np.sin, np.exp, np.maximum, and np.clip.",
-        "reference_mode": "fine_grid",
-    },
-}
-
-ALLOWED_SYMBOLS = {
-    "np": np,
-    "sin": np.sin,
-    "cos": np.cos,
-    "tan": np.tan,
-    "exp": np.exp,
-    "sqrt": np.sqrt,
-    "abs": np.abs,
-    "tanh": np.tanh,
-    "where": np.where,
-    "maximum": np.maximum,
-    "minimum": np.minimum,
-    "clip": np.clip,
-    "pi": np.pi,
 }
 
 
 @dataclass
-class BurgersConfig:
-    xmin: float = -4.0
-    xmax: float = 10.0
-    nx: int = 501
-    t_end: float = 5.0
-    frames: int = 121
-    cfl: float = 0.72
+class SimulationRecord:
+    mode: str
+    config: SolverConfig | ThermalSolverConfig
+    x: np.ndarray
+    y: np.ndarray
+    X: np.ndarray
+    Y: np.ndarray
+    snapshots: list[FlowSnapshot | ThermalFlowSnapshot]
+    ranges: dict[str, tuple[float, float]]
+    levels: dict[str, np.ndarray]
+    history: dict[str, np.ndarray]
+    signature: tuple[Any, ...]
 
 
-def evaluate_initial_condition(expression, x):
-    local_env = dict(ALLOWED_SYMBOLS)
-    local_env["x"] = x
-    values = eval(expression, {"__builtins__": {}}, local_env)
-    array = np.asarray(values, dtype=float)
-    if array.shape == ():
-        array = np.full_like(x, float(array), dtype=float)
-    if array.shape != x.shape:
-        raise ValueError("The initial condition expression must evaluate to an array with the same shape as x.")
-    return array
+def init_state() -> None:
+    for key, value in DEFAULTS.items():
+        st.session_state.setdefault(key, value)
+    st.session_state.setdefault("preset", "Classical Laminar Cavity")
+    st.session_state.setdefault("_last_preset", None)
+    st.session_state.setdefault("result", None)
+    st.session_state.setdefault("frame_index", 0)
+    st.session_state.setdefault("view_name", "Overview Fields")
 
 
-def burgers_exact_triangle(x, time):
-    x = np.asarray(x)
-    u = np.zeros_like(x, dtype=float)
-    if time <= 1.0:
-        mask1 = (x >= -1.0) & (x < time)
-        mask2 = (x >= time) & (x <= 1.0)
-        u[mask1] = (1.0 + x[mask1]) / (1.0 + time)
-        u[mask2] = (1.0 - x[mask2]) / (1.0 - time)
-    else:
-        x_s = np.sqrt(2.0 * (1.0 + time)) - 1.0
-        mask = (x >= -1.0) & (x < x_s)
-        u[mask] = (1.0 + x[mask]) / (1.0 + time)
-    return u
+def apply_preset(name: str) -> None:
+    values = dict(DEFAULTS)
+    values.update(PRESETS[name])
+    for key, value in values.items():
+        if key != "description":
+            st.session_state[key] = value
 
 
-def step_conservative(u, dt, dx, left_bc, right_bc):
-    sigma = dt / dx
-    un = u.copy()
-    um = np.roll(un, 1)
-    up = np.roll(un, -1)
-    am = 0.5 * (un + um)
-    ap = 0.5 * (up + un)
-    u_new = (
-        un
-        - 0.5 * sigma * (am + np.abs(am)) * (un - um)
-        - 0.5 * sigma * (ap - np.abs(ap)) * (up - un)
-    )
-    u_new[0] = left_bc
-    u_new[-1] = right_bc
-    return u_new
+def safe_range(vmin: float, vmax: float, pad: float = 1.0) -> tuple[float, float]:
+    if abs(vmax - vmin) < 1.0e-12:
+        center = 0.5 * (vmin + vmax)
+        return center - pad, center + pad
+    return float(vmin), float(vmax)
 
 
-def step_nonconservative(u, dt, dx, left_bc, right_bc):
-    sigma = dt / dx
-    un = u.copy()
-    um = np.roll(un, 1)
-    up = np.roll(un, -1)
-    du = np.where(un >= 0.0, un - um, up - un)
-    u_new = un - sigma * un * du
-    u_new[0] = left_bc
-    u_new[-1] = right_bc
-    return u_new
+def signature(mode: str, config: SolverConfig | ThermalSolverConfig) -> tuple[Any, ...]:
+    return mode, tuple(sorted((key, repr(value)) for key, value in asdict(config).items()))
 
 
-def solve_scheme_snapshots(x, output_times, u0, scheme_name, cfl):
-    dx = x[1] - x[0]
-    left_bc = u0[0]
-    right_bc = u0[-1]
-    current = u0.copy()
-    snapshots = np.zeros((len(output_times), len(x)), dtype=float)
-    snapshots[0] = current
-    t_now = 0.0
-    frame = 0
-    step_fn = step_conservative if scheme_name == "conservative" else step_nonconservative
-    while frame < len(output_times) - 1:
-        t_target = output_times[frame + 1]
-        while t_now < t_target - 1e-12:
-            speed = max(np.max(np.abs(current)), 1e-8)
-            dt = min(cfl * dx / speed, t_target - t_now)
-            current = step_fn(current, dt, dx, left_bc, right_bc)
-            t_now += dt
-        frame += 1
-        snapshots[frame] = current
-    return snapshots
+def build_config() -> tuple[str, SolverConfig | ThermalSolverConfig]:
+    mode = str(st.session_state["mode"]).strip().lower()
+    nx = int(st.session_state["nx"])
+    ny = int(st.session_state["ny"])
+    reynolds = float(st.session_state["reynolds"])
+    lid_velocity = float(st.session_state["lid_velocity"])
+    final_time = float(st.session_state["final_time"])
+    cfl_number = float(st.session_state["cfl_number"])
+    frame_stride = int(st.session_state["frame_stride"])
+    poisson_max_iter = int(st.session_state["poisson_max_iter"])
 
+    if nx < 11 or ny < 11:
+        raise ValueError("Grid sizes nx and ny must be at least 11.")
+    if reynolds <= 0.0 or lid_velocity <= 0.0 or final_time <= 0.0:
+        raise ValueError("Reynolds number, lid velocity, and final time must be positive.")
+    if not (0.0 < cfl_number <= 1.0):
+        raise ValueError("The CFL number should be in the range (0, 1].")
+    if frame_stride < 1 or poisson_max_iter < 1:
+        raise ValueError("Frame stride and Poisson iterations must be positive integers.")
 
-def compute_reference_snapshots(config, output_times, expression, preset_name, current_expression):
-    x = np.linspace(config.xmin, config.xmax, config.nx)
-    preset = PRESETS[preset_name]
-    if preset["reference_mode"] == "analytic_triangle" and current_expression.strip() == preset["expression"].strip():
-        reference = np.zeros((len(output_times), config.nx), dtype=float)
-        for idx, time_value in enumerate(output_times):
-            reference[idx] = burgers_exact_triangle(x, time_value)
-        return reference, "Analytic exact reference"
-
-    refine_factor = 4
-    nx_ref = refine_factor * (config.nx - 1) + 1
-    x_ref = np.linspace(config.xmin, config.xmax, nx_ref)
-    u0_ref = evaluate_initial_condition(expression, x_ref)
-    ref_snapshots_fine = solve_scheme_snapshots(
-        x_ref,
-        output_times,
-        u0_ref,
-        scheme_name="conservative",
-        cfl=min(0.55, 0.85 * config.cfl),
-    )
-    reference = np.zeros((len(output_times), config.nx), dtype=float)
-    for idx in range(len(output_times)):
-        reference[idx] = np.interp(x, x_ref, ref_snapshots_fine[idx])
-    return reference, "Fine-grid conservative reference"
-
-
-def build_results(config, expression, preset_name):
-    x = np.linspace(config.xmin, config.xmax, config.nx)
-    output_times = np.linspace(0.0, config.t_end, config.frames)
-    u0 = evaluate_initial_condition(expression, x)
-    reference, reference_label = compute_reference_snapshots(config, output_times, expression, preset_name, expression)
-    nonconservative = solve_scheme_snapshots(x, output_times, u0, scheme_name="nonconservative", cfl=config.cfl)
-    conservative = solve_scheme_snapshots(x, output_times, u0, scheme_name="conservative", cfl=config.cfl)
-
-    l1_noncons = float(np.mean(np.abs(nonconservative[-1] - reference[-1])))
-    l1_cons = float(np.mean(np.abs(conservative[-1] - reference[-1])))
-    linf_noncons = float(np.max(np.abs(nonconservative[-1] - reference[-1])))
-    linf_cons = float(np.max(np.abs(conservative[-1] - reference[-1])))
-
-    all_values = np.concatenate([reference.ravel(), nonconservative.ravel(), conservative.ravel()])
-    plot_min = min(-0.02, float(np.min(all_values)))
-    plot_max = max(1.02, float(np.max(all_values)))
-    span = max(plot_max - plot_min, 1e-8)
-
-    return {
-        "x": x,
-        "times": output_times,
-        "u0": u0,
-        "reference": reference,
-        "nonconservative": nonconservative,
-        "conservative": conservative,
-        "reference_label": reference_label,
-        "line_ylim": (plot_min - 0.04 * span, plot_max + 0.06 * span),
-        "color_limits": (plot_min, plot_max),
-        "metrics": {
-            "noncons_l1": l1_noncons,
-            "cons_l1": l1_cons,
-            "noncons_linf": linf_noncons,
-            "cons_linf": linf_cons,
-        },
+    kwargs = {
+        "nx": nx,
+        "ny": ny,
+        "reynolds": reynolds,
+        "lid_velocity": lid_velocity,
+        "final_time": final_time,
+        "cfl_number": cfl_number,
+        "frame_stride": frame_stride,
+        "poisson_max_iter": poisson_max_iter,
+        "poisson_solver": "factorized",
+        "animation_interval_ms": 80,
     }
 
+    if mode == "flow":
+        return mode, SolverConfig(**kwargs)
 
-@st.cache_data(show_spinner=False)
-def cached_build_results(xmin, xmax, nx, t_end, frames, cfl, expression, preset_name):
-    config = BurgersConfig(xmin=xmin, xmax=xmax, nx=nx, t_end=t_end, frames=frames, cfl=cfl)
-    return build_results(config, expression, preset_name)
+    thermal_diffusivity = float(st.session_state["thermal_diffusivity"])
+    thermal_conductivity = float(st.session_state["thermal_conductivity"])
+    if thermal_diffusivity <= 0.0 or thermal_conductivity <= 0.0:
+        raise ValueError("Thermal diffusivity and thermal conductivity must be positive.")
 
-
-def make_figure(results, frame_index):
-    cmap = colormaps["jet"].copy()
-    cmap.set_bad(color="white")
-
-    x = results["x"]
-    times = results["times"]
-    ymin, ymax = results["line_ylim"]
-    vmin, vmax = results["color_limits"]
-    t_value = float(times[frame_index])
-
-    fig = plt.figure(figsize=(11.2, 7.8), facecolor=PALETTE["paper"])
-    grid = fig.add_gridspec(
-        2, 3,
-        left=0.06, right=0.95, bottom=0.10, top=0.80,
-        width_ratios=[1.0, 1.0, 0.05],
-        height_ratios=[0.92, 1.12],
-        hspace=0.24, wspace=0.14,
+    return mode, ThermalSolverConfig(
+        **kwargs,
+        thermal_diffusivity=thermal_diffusivity,
+        thermal_conductivity=thermal_conductivity,
+        initial_temperature=float(st.session_state["initial_temperature"]),
+        top_temperature=float(st.session_state["top_temperature"]),
+        left_temperature=float(st.session_state["left_temperature"]),
+        right_temperature=float(st.session_state["right_temperature"]),
+        bottom_bc_mode=str(st.session_state["bottom_bc_mode"]).strip().lower(),
+        bottom_temperature=float(st.session_state["bottom_temperature"]),
+        bottom_heat_flux=float(st.session_state["bottom_heat_flux"]),
+        volumetric_heat_source=float(st.session_state["volumetric_heat_source"]),
+        source_x_min=float(st.session_state["source_x_min"]),
+        source_x_max=float(st.session_state["source_x_max"]),
+        source_y_min=float(st.session_state["source_y_min"]),
+        source_y_max=float(st.session_state["source_y_max"]),
     )
-    ax1 = fig.add_subplot(grid[0, 0])
-    ax2 = fig.add_subplot(grid[0, 1])
-    ax3 = fig.add_subplot(grid[1, 0])
-    ax4 = fig.add_subplot(grid[1, 1])
-    cax = fig.add_subplot(grid[:, 2])
 
-    fig.text(0.06, 0.965, "Burgers Equation: Conservative vs Non-conservative Forms",
-             ha="left", fontsize=18, fontweight="bold", color=PALETTE["ink"])
-    fig.text(0.06, 0.925,
-             "Top row: snapshots against the reference solution. Bottom row: space-time evolution with one shared color scale.",
-             ha="left", fontsize=10.4, color=PALETTE["muted"])
-    fig.text(0.94, 0.955, f"t = {t_value:.2f}", ha="right", va="center", fontsize=12.5,
-             fontweight="bold", color=PALETTE["ink"],
-             bbox={"boxstyle": "round,pad=0.28", "facecolor": "#f7f3eb", "edgecolor": "#d6d3d1", "linewidth": 0.9})
 
-    progress = 1.0 if times[-1] <= 0 else t_value / times[-1]
-    fig.add_artist(Rectangle((0.06, 0.895), 0.89, 0.007, transform=fig.transFigure,
-                             linewidth=0, facecolor="#d8e5e2", zorder=20))
-    fig.add_artist(Rectangle((0.06, 0.895), 0.89 * max(progress, 0.002), 0.007, transform=fig.transFigure,
-                             linewidth=0, facecolor=PALETTE["accent"], zorder=21))
+def build_record(
+    mode: str,
+    solver: LidDrivenCavitySolver | LidDrivenCavityThermalSolver,
+    snapshots: list[FlowSnapshot | ThermalFlowSnapshot],
+) -> SimulationRecord:
+    pressure_fields = [frame.pressure for frame in snapshots if frame.pressure is not None]
+    omega_samples = np.concatenate([np.abs(frame.omega[1:-1, 1:-1]).ravel() for frame in snapshots])
 
-    legend_lines = [
-        Line2D([0], [0], color="#111827", lw=2.6),
-        Line2D([0], [0], color="#2563eb", lw=2.3, ls="--"),
-        Line2D([0], [0], color="#d9480f", lw=2.3, ls="--"),
+    ranges = {
+        "velocity": (0.0, max(float(max(np.max(frame.velocity_magnitude) for frame in snapshots)), 1.0e-10)),
+        "psi": safe_range(
+            float(min(np.min(frame.psi) for frame in snapshots)),
+            float(max(np.max(frame.psi) for frame in snapshots)),
+        ),
+        "omega": safe_range(
+            -max(float(np.percentile(omega_samples, 99.0)), 1.0e-10),
+            max(float(np.percentile(omega_samples, 99.0)), 1.0e-10),
+            pad=1.0e-10,
+        ),
+        "u": safe_range(
+            -float(max(np.max(np.abs(frame.u)) for frame in snapshots)),
+            float(max(np.max(np.abs(frame.u)) for frame in snapshots)),
+        ),
+        "v": safe_range(
+            -float(max(np.max(np.abs(frame.v)) for frame in snapshots)),
+            float(max(np.max(np.abs(frame.v)) for frame in snapshots)),
+        ),
+        "pressure": safe_range(
+            float(min(np.min(field) for field in pressure_fields)),
+            float(max(np.max(field) for field in pressure_fields)),
+        ),
+    }
+
+    levels = {name: np.linspace(vmin, vmax, 32) for name, (vmin, vmax) in ranges.items()}
+    history = {
+        "time": np.array([frame.time for frame in snapshots], dtype=float),
+        "max_velocity": np.array([np.max(frame.velocity_magnitude) for frame in snapshots], dtype=float),
+        "max_vorticity": np.array([np.max(np.abs(frame.omega[1:-1, 1:-1])) for frame in snapshots], dtype=float),
+    }
+
+    if mode == "thermal":
+        temperatures = [frame.temperature for frame in snapshots if isinstance(frame, ThermalFlowSnapshot)]
+        ranges["temperature"] = safe_range(
+            float(min(np.min(field) for field in temperatures)),
+            float(max(np.max(field) for field in temperatures)),
+        )
+        levels["temperature"] = np.linspace(*ranges["temperature"], 32)
+        history["max_temperature"] = np.array([np.max(frame.temperature) for frame in snapshots], dtype=float)
+
+    return SimulationRecord(
+        mode=mode,
+        config=solver.config,
+        x=solver.x.copy(),
+        y=solver.y.copy(),
+        X=solver.X.copy(),
+        Y=solver.Y.copy(),
+        snapshots=snapshots,
+        ranges=ranges,
+        levels=levels,
+        history=history,
+        signature=signature(mode, solver.config),
+    )
+
+
+def run_simulation(mode: str, config: SolverConfig | ThermalSolverConfig, status_box: Any, summary_box: Any, progress_bar: Any) -> SimulationRecord:
+    progress_bar.progress(0)
+    status_box.markdown("**Preparing solver...**")
+    summary_box.caption("Transient fields will be marched first, then each saved frame will recover pressure.")
+
+    solver: LidDrivenCavitySolver | LidDrivenCavityThermalSolver
+    solver = LidDrivenCavitySolver(config) if mode == "flow" else LidDrivenCavityThermalSolver(config)
+
+    def progress_callback(info: dict[str, float]) -> None:
+        progress_bar.progress(min(int(84.0 * float(info.get("progress", 0.0))), 84))
+        status_box.markdown(
+            "**Marching in time**  \n"
+            f"step = {int(info.get('step', 0))}  |  time = {float(info.get('time', 0.0)):.3f} s  |  dt = {float(info.get('dt', 0.0)):.3e} s"
+        )
+        summary = (
+            f"max|u| = {float(info.get('max_velocity', 0.0)):.3f} m/s  |  "
+            f"max|omega| = {float(info.get('max_vorticity', 0.0)):.3f} s^-1"
+        )
+        if mode == "thermal":
+            summary += f"  |  max T = {float(info.get('max_temperature', 0.0)):.3f} K"
+        summary_box.caption(summary)
+
+    with contextlib.redirect_stdout(StringIO()), contextlib.redirect_stderr(StringIO()):
+        snapshots = solver.run(progress_callback=progress_callback)
+
+    total = max(len(snapshots), 1)
+    for idx, snapshot in enumerate(snapshots, start=1):
+        snapshot.pressure = solver.recover_pressure_field(snapshot)
+        progress_bar.progress(min(84 + int(16.0 * idx / total), 100))
+        status_box.markdown(f"**Recovering pressure field**  \nframe {idx} / {total}")
+
+    progress_bar.progress(100)
+    status_box.markdown("**Computation complete.**")
+    summary_box.caption(f"{len(snapshots)} saved frames are ready up to t = {snapshots[-1].time:.3f} s.")
+    return build_record(mode, solver, snapshots)
+
+
+def figure_to_png(figure: Figure) -> bytes:
+    buffer = BytesIO()
+    figure.savefig(buffer, format="png", dpi=180, facecolor=figure.get_facecolor(), bbox_inches="tight")
+    return buffer.getvalue()
+
+
+def style_axis(axis: Any, config: SolverConfig | ThermalSolverConfig) -> None:
+    axis.set_xlim(0.0, config.lx)
+    axis.set_ylim(0.0, config.ly)
+    axis.set_xlabel("x [m]")
+    axis.set_ylabel("y [m]")
+    axis.set_aspect("equal")
+    axis.tick_params(direction="out", length=4, width=0.8)
+    axis.set_facecolor(PALETTE["panel"])
+
+
+def add_time_banner(figure: Figure, fraction: float, label: str) -> None:
+    x0, y0, width = 0.06, 0.905, 0.88
+    figure.add_artist(Rectangle((x0, y0), width, 0.008, transform=figure.transFigure, linewidth=0, facecolor=PALETTE["accent_soft"], zorder=20))
+    figure.add_artist(Rectangle((x0, y0), width * max(float(np.clip(fraction, 0.0, 1.0)), 0.002), 0.008, transform=figure.transFigure, linewidth=0, facecolor=PALETTE["accent"], zorder=21))
+    figure.text(0.94, 0.955, label, ha="right", va="center", fontsize=12.2, fontweight="bold", color=PALETTE["ink"], bbox={"boxstyle": "round,pad=0.28", "facecolor": "#f7f3eb", "edgecolor": "#d6d3d1", "linewidth": 0.9})
+
+
+def build_overview_figure(record: SimulationRecord, frame_index: int) -> Figure:
+    snapshot = record.snapshots[frame_index]
+    figure = Figure(figsize=(12.0, 7.4), facecolor=PALETTE["paper"])
+    grid = figure.add_gridspec(2, 2, width_ratios=[1.35, 1.0], height_ratios=[1.0, 1.0], wspace=0.22, hspace=0.30)
+    velocity_ax = figure.add_subplot(grid[:, 0])
+    psi_ax = figure.add_subplot(grid[0, 1])
+    omega_ax = figure.add_subplot(grid[1, 1])
+
+    figure.text(0.06, 0.965, "2-D Lid-Driven Cavity: Flow Overview", ha="left", fontsize=18, fontweight="bold", color=PALETTE["ink"])
+    figure.text(0.06, 0.928, "Velocity magnitude and streamlines reveal the main cell, while streamfunction and vorticity expose the rotational structure.", ha="left", fontsize=10.3, color=PALETTE["muted"])
+    add_time_banner(figure, snapshot.time / max(record.config.final_time, 1.0e-12), f"t = {snapshot.time:.3f} s")
+
+    velocity_ax.contourf(record.X, record.Y, snapshot.velocity_magnitude, levels=record.levels["velocity"], cmap="jet", extend="max")
+    velocity_ax.streamplot(record.x, record.y, snapshot.u, snapshot.v, density=1.0, color="white", linewidth=1.0)
+    psi_ax.contourf(record.X, record.Y, snapshot.psi, levels=record.levels["psi"], cmap="jet")
+    omega_ax.contourf(record.X, record.Y, np.clip(snapshot.omega, *record.ranges["omega"]), levels=record.levels["omega"], cmap="jet", extend="both")
+
+    for axis in (velocity_ax, psi_ax, omega_ax):
+        style_axis(axis, record.config)
+
+    velocity_ax.set_title("Velocity Magnitude and Streamlines", loc="left", fontsize=12, fontweight="bold")
+    psi_ax.set_title("Streamfunction", loc="left", fontsize=12, fontweight="bold")
+    omega_ax.set_title("Vorticity", loc="left", fontsize=12, fontweight="bold")
+    figure.colorbar(cm.ScalarMappable(norm=Normalize(*record.ranges["velocity"]), cmap="jet"), ax=velocity_ax, fraction=0.046, pad=0.018, label="Velocity Magnitude [m/s]")
+    figure.colorbar(cm.ScalarMappable(norm=Normalize(*record.ranges["psi"]), cmap="jet"), ax=psi_ax, fraction=0.046, pad=0.025, label="Streamfunction psi")
+    figure.colorbar(cm.ScalarMappable(norm=Normalize(*record.ranges["omega"]), cmap="jet"), ax=omega_ax, fraction=0.046, pad=0.025, label="Vorticity omega", extend="both")
+    return figure
+
+
+def build_detail_figure(record: SimulationRecord, frame_index: int) -> Figure:
+    snapshot = record.snapshots[frame_index]
+    figure = Figure(figsize=(12.0, 6.2), facecolor=PALETTE["paper"])
+    grid = figure.add_gridspec(1, 3, wspace=0.26)
+    u_ax = figure.add_subplot(grid[0, 0])
+    v_ax = figure.add_subplot(grid[0, 1])
+    p_ax = figure.add_subplot(grid[0, 2])
+
+    figure.text(0.055, 0.965, "Velocity Components and Pressure", ha="left", fontsize=18, fontweight="bold", color=PALETTE["ink"])
+    figure.text(0.055, 0.928, "Component fields make the lid shear layers easier to read, and pressure is recovered after the transient solve finishes.", ha="left", fontsize=10.3, color=PALETTE["muted"])
+    add_time_banner(figure, snapshot.time / max(record.config.final_time, 1.0e-12), f"step = {snapshot.step}")
+
+    u_ax.contourf(record.X, record.Y, snapshot.u, levels=record.levels["u"], cmap="jet", extend="both")
+    v_ax.contourf(record.X, record.Y, snapshot.v, levels=record.levels["v"], cmap="jet", extend="both")
+    p_ax.contourf(record.X, record.Y, snapshot.pressure, levels=record.levels["pressure"], cmap="jet", extend="both")
+
+    for axis in (u_ax, v_ax, p_ax):
+        style_axis(axis, record.config)
+
+    u_ax.set_title("u-Velocity", loc="left", fontsize=12, fontweight="bold")
+    v_ax.set_title("v-Velocity", loc="left", fontsize=12, fontweight="bold")
+    p_ax.set_title("Pressure", loc="left", fontsize=12, fontweight="bold")
+    figure.colorbar(cm.ScalarMappable(norm=Normalize(*record.ranges["u"]), cmap="jet"), ax=u_ax, orientation="horizontal", fraction=0.055, pad=0.10, label="u [m/s]")
+    figure.colorbar(cm.ScalarMappable(norm=Normalize(*record.ranges["v"]), cmap="jet"), ax=v_ax, orientation="horizontal", fraction=0.055, pad=0.10, label="v [m/s]")
+    figure.colorbar(cm.ScalarMappable(norm=Normalize(*record.ranges["pressure"]), cmap="jet"), ax=p_ax, orientation="horizontal", fraction=0.055, pad=0.10, label="Pressure [Pa]")
+    return figure
+
+
+def build_temperature_figure(record: SimulationRecord, frame_index: int) -> Figure:
+    snapshot = record.snapshots[frame_index]
+    if not isinstance(snapshot, ThermalFlowSnapshot):
+        raise ValueError("Temperature view requires a thermal simulation.")
+
+    figure = Figure(figsize=(12.0, 6.2), facecolor=PALETTE["paper"])
+    grid = figure.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=0.22)
+    velocity_ax = figure.add_subplot(grid[0, 0])
+    temperature_ax = figure.add_subplot(grid[0, 1])
+
+    figure.text(0.06, 0.965, "Velocity and Temperature", ha="left", fontsize=18, fontweight="bold", color=PALETTE["ink"])
+    figure.text(0.06, 0.928, "This couples the cavity flow to advection-diffusion in temperature; the dashed box marks the active source region when q''' is nonzero.", ha="left", fontsize=10.3, color=PALETTE["muted"])
+    add_time_banner(figure, snapshot.time / max(record.config.final_time, 1.0e-12), f"Tmax = {np.max(snapshot.temperature):.2f} K")
+
+    velocity_ax.contourf(record.X, record.Y, snapshot.velocity_magnitude, levels=record.levels["velocity"], cmap="jet", extend="max")
+    velocity_ax.streamplot(record.x, record.y, snapshot.u, snapshot.v, density=1.0, color="white", linewidth=1.0)
+    temperature_ax.contourf(record.X, record.Y, snapshot.temperature, levels=record.levels["temperature"], cmap="jet", extend="both")
+
+    if abs(record.config.volumetric_heat_source) > 0.0:
+        width = max(record.config.source_x_max - record.config.source_x_min, 0.0)
+        height = max(record.config.source_y_max - record.config.source_y_min, 0.0)
+        if width > 0.0 and height > 0.0:
+            temperature_ax.add_patch(Rectangle((record.config.source_x_min, record.config.source_y_min), width, height, facecolor="none", edgecolor="white", linewidth=1.5, linestyle="--"))
+
+    for axis in (velocity_ax, temperature_ax):
+        style_axis(axis, record.config)
+
+    velocity_ax.set_title("Velocity Magnitude and Streamlines", loc="left", fontsize=12, fontweight="bold")
+    temperature_ax.set_title("Temperature", loc="left", fontsize=12, fontweight="bold")
+    figure.colorbar(cm.ScalarMappable(norm=Normalize(*record.ranges["velocity"]), cmap="jet"), ax=velocity_ax, orientation="horizontal", fraction=0.055, pad=0.10, label="Velocity Magnitude [m/s]")
+    figure.colorbar(cm.ScalarMappable(norm=Normalize(*record.ranges["temperature"]), cmap="jet"), ax=temperature_ax, orientation="horizontal", fraction=0.055, pad=0.10, label="Temperature [K]")
+    return figure
+
+
+def build_history_figure(record: SimulationRecord, frame_index: int) -> Figure:
+    snapshot = record.snapshots[frame_index]
+    series = [
+        ("Max speed", record.history["max_velocity"], PALETTE["accent"], "m/s"),
+        ("Max |omega|", record.history["max_vorticity"], PALETTE["secondary"], "s^-1"),
     ]
-    fig.legend(legend_lines, ["Reference", "Non-conservative", "Conservative"],
-               loc="upper center", bbox_to_anchor=(0.44, 0.895), ncol=3, frameon=False,
-               handlelength=2.0, columnspacing=2.0)
+    if record.mode == "thermal":
+        series.append(("Max temperature", record.history["max_temperature"], "#2563eb", "K"))
 
-    for ax in (ax1, ax2, ax3, ax4):
-        ax.set_facecolor(PALETTE["panel"])
-        ax.grid(True, alpha=0.22, linestyle="--", linewidth=0.8)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-
-    ax1.set_title("Non-conservative form", loc="left", fontweight="bold")
-    ax2.set_title("Conservative form", loc="left", fontweight="bold")
-    ax3.set_title("Space-time evolution: Non-conservative", loc="left", fontweight="bold")
-    ax4.set_title("Space-time evolution: Conservative", loc="left", fontweight="bold")
-
-    ax1.plot(x, results["reference"][frame_index], color="#111827", lw=2.6)
-    ax1.plot(x, results["nonconservative"][frame_index], color="#2563eb", lw=2.3, ls="--")
-    ax2.plot(x, results["reference"][frame_index], color="#111827", lw=2.6)
-    ax2.plot(x, results["conservative"][frame_index], color="#d9480f", lw=2.3, ls="--")
-
-    for ax in (ax1, ax2):
-        ax.set_xlim(float(x[0]), float(x[-1]))
-        ax.set_ylim(ymin, ymax)
-        ax.set_xlabel("$x$")
-        ax.set_ylabel("$u$")
-
-    mask_noncons = np.ones_like(results["nonconservative"], dtype=bool)
-    mask_noncons[:frame_index + 1, :] = False
-    mask_cons = np.ones_like(results["conservative"], dtype=bool)
-    mask_cons[:frame_index + 1, :] = False
-
-    img_noncons = ax3.imshow(np.ma.array(results["nonconservative"], mask=mask_noncons), origin="lower",
-                             extent=[float(x[0]), float(x[-1]), float(times[0]), float(times[-1])],
-                             aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
-    ax4.imshow(np.ma.array(results["conservative"], mask=mask_cons), origin="lower",
-               extent=[float(x[0]), float(x[-1]), float(times[0]), float(times[-1])],
-               aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
-
-    for ax in (ax3, ax4):
-        ax.set_xlim(float(x[0]), float(x[-1]))
-        ax.set_ylim(float(times[0]), float(times[-1]))
-        ax.set_xlabel("$x$")
-        ax.set_ylabel("$t$")
-        ax.axhline(t_value, color=PALETTE["accent"], lw=1.5, ls="--")
-
-    cbar = fig.colorbar(img_noncons, cax=cax)
-    cbar.set_label("Solution value $u$")
-    return fig
+    figure = Figure(figsize=(4.1 * len(series), 3.5), facecolor=PALETTE["paper"])
+    grid = figure.add_gridspec(1, len(series), wspace=0.28)
+    for idx, (title, values, color, unit) in enumerate(series):
+        axis = figure.add_subplot(grid[0, idx])
+        axis.plot(record.history["time"], values, color=color, linewidth=2.4)
+        axis.axvline(snapshot.time, color=PALETTE["ink"], linestyle="--", linewidth=1.1)
+        axis.set_title(title, loc="left", fontsize=11.5, fontweight="bold")
+        axis.set_xlabel("time [s]")
+        axis.set_ylabel(unit)
+        axis.grid(True, linestyle="--", linewidth=0.75, alpha=0.28)
+        axis.spines["top"].set_visible(False)
+        axis.spines["right"].set_visible(False)
+        axis.set_facecolor(PALETTE["panel"])
+    figure.suptitle("Transient history across the saved frames", fontsize=14, fontweight="bold", y=0.99)
+    return figure
 
 
-def main():
-    st.set_page_config(page_title="Burgers Equation Studio", layout="wide")
-    st.title("Burgers Equation Studio")
-    st.caption("Streamlit version migrated from a Tkinter teaching demo.")
+def render_sidebar() -> tuple[bool, Any, Any, Any]:
+    st.sidebar.title("Simulation Controls")
+    st.sidebar.caption("Unit-square cavity, streamfunction-vorticity flow solve, optional thermal transport.")
+    preset = st.sidebar.selectbox("Teaching case", list(PRESETS.keys()), key="preset")
+    if st.session_state["_last_preset"] != preset:
+        apply_preset(preset)
+        st.session_state["_last_preset"] = preset
+    st.sidebar.caption(PRESETS[preset]["description"])
+    if st.sidebar.button("Restore selected preset", use_container_width=True):
+        apply_preset(preset)
+        st.rerun()
 
-    with st.sidebar:
-        st.header("Initial condition")
-        preset_name = st.selectbox("Preset", list(PRESETS.keys()), index=0)
-        st.write(PRESETS[preset_name]["description"])
-        expression = st.text_area("u0(x) expression", value=PRESETS[preset_name]["expression"], height=120)
+    st.sidebar.radio("Physics mode", ["flow", "thermal"], key="mode", horizontal=True, format_func=lambda value: "Flow only" if value == "flow" else "Flow + temperature")
+    with st.sidebar.expander("Flow parameters", expanded=True):
+        c1, c2 = st.columns(2)
+        c1.number_input("nx", min_value=11, step=10, key="nx")
+        c2.number_input("ny", min_value=11, step=10, key="ny")
+        st.number_input("Reynolds number", min_value=1.0, step=50.0, key="reynolds")
+        st.number_input("Lid velocity [m/s]", min_value=0.01, step=0.1, key="lid_velocity")
+        st.number_input("Final time [s]", min_value=0.01, step=0.5, key="final_time")
+        st.number_input("CFL number", min_value=0.01, max_value=1.0, step=0.05, key="cfl_number")
+        st.number_input("Frame stride", min_value=1, step=10, key="frame_stride")
+        st.number_input("Poisson iterations", min_value=1, step=10, key="poisson_max_iter")
 
-        st.header("Numerical setup")
-        xmin = st.number_input("x_min", value=-4.0)
-        xmax = st.number_input("x_max", value=10.0)
-        nx = st.number_input("Nx", min_value=101, max_value=2001, value=501, step=50)
-        t_end = st.number_input("t_end", min_value=0.1, value=5.0, step=0.1)
-        frames = st.number_input("frames", min_value=20, max_value=400, value=121, step=10)
-        cfl = st.number_input("CFL", min_value=0.05, max_value=1.5, value=0.72, step=0.01, format="%.2f")
-        run = st.button("Compute", use_container_width=True)
+    if st.session_state["mode"] == "thermal":
+        with st.sidebar.expander("Thermal parameters", expanded=True):
+            st.number_input("Thermal diffusivity [m^2/s]", min_value=1.0e-8, step=1.0e-4, format="%.6f", key="thermal_diffusivity")
+            st.number_input("Thermal conductivity [W/(m K)]", min_value=1.0e-8, step=0.1, key="thermal_conductivity")
+            st.number_input("Initial temperature [K]", step=1.0, key="initial_temperature")
+            st.number_input("Top wall temperature [K]", step=1.0, key="top_temperature")
+            st.number_input("Left wall temperature [K]", step=1.0, key="left_temperature")
+            st.number_input("Right wall temperature [K]", step=1.0, key="right_temperature")
+            st.selectbox("Bottom boundary mode", ["fixed_temperature", "heat_flux"], key="bottom_bc_mode")
+            st.number_input("Bottom temperature [K]", step=1.0, key="bottom_temperature")
+            st.number_input("Bottom heat flux [W/m^2]", step=10.0, key="bottom_heat_flux")
+        with st.sidebar.expander("Internal heat source", expanded=False):
+            st.number_input("Volumetric heat source [W/m^3]", step=1.0e5, format="%.3e", key="volumetric_heat_source")
+            c1, c2 = st.columns(2)
+            c1.number_input("x min [m]", step=0.05, key="source_x_min")
+            c2.number_input("x max [m]", step=0.05, key="source_x_max")
+            c1.number_input("y min [m]", step=0.05, key="source_y_min")
+            c2.number_input("y max [m]", step=0.05, key="source_y_max")
 
-    if "results" not in st.session_state:
-        st.info("Pick a preset or edit the initial condition, then click **Compute**.")
+    compute = st.sidebar.button("Compute Solution", type="primary", use_container_width=True)
+    if st.sidebar.button("Clear Results", use_container_width=True):
+        st.session_state["result"] = None
+        st.session_state["frame_index"] = 0
+        st.rerun()
+    status_box = st.sidebar.empty()
+    progress_bar = st.sidebar.progress(0)
+    summary_box = st.sidebar.empty()
+    return compute, status_box, summary_box, progress_bar
 
-    if run:
+
+def render_intro() -> None:
+    st.markdown(
+        """
+        <style>
+        .stApp { background: linear-gradient(180deg, #f6efe4 0%, #eef3f9 40%, #fbfdff 100%); }
+        [data-testid="stSidebar"] { background: linear-gradient(180deg, #f8f4ec 0%, #edf3fb 100%); }
+        .hero { background: rgba(255,255,255,0.92); border: 1px solid rgba(19,34,56,0.08); border-radius: 18px; padding: 1.2rem 1.3rem; box-shadow: 0 16px 40px rgba(19,34,56,0.08); margin-bottom: 1rem; }
+        .hero h1 { color: #132238; margin: 0 0 0.35rem 0; }
+        .hero p { color: #5b6b82; margin: 0; line-height: 1.55; }
+        </style>
+        <div class="hero">
+        <h1>Cavity Flow Teaching Studio</h1>
+        <p>This file now uses Streamlit as the interface layer while preserving the existing cavity-flow solver, thermal extension, and teaching-oriented multi-panel visualization workflow.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    a, b, c = st.columns(3)
+    a.info("Overview Fields: velocity magnitude, streamlines, streamfunction, and vorticity.")
+    b.info("Velocity and Pressure: component fields plus the post-processed pressure solution.")
+    c.info("Temperature Field: the thermal extension with wall heating and interior source support.")
+
+
+def render_results(record: SimulationRecord) -> None:
+    frame_max = len(record.snapshots) - 1
+    st.session_state["frame_index"] = int(np.clip(st.session_state["frame_index"], 0, frame_max))
+    snapshot = record.snapshots[st.session_state["frame_index"]]
+
+    try:
+        current_mode, current_config = build_config()
+        if signature(current_mode, current_config) != record.signature:
+            st.warning("The sidebar inputs have changed since the last run. The plots below still show the previously computed solution until you recompute.")
+    except Exception:
+        pass
+
+    cols = st.columns(5 if record.mode == "thermal" else 4)
+    cols[0].metric("Time", f"{snapshot.time:.3f} s")
+    cols[1].metric("Saved Frame", f"{st.session_state['frame_index'] + 1}/{len(record.snapshots)}")
+    cols[2].metric("Max Speed", f"{np.max(snapshot.velocity_magnitude):.3f} m/s")
+    cols[3].metric("Max |omega|", f"{np.max(np.abs(snapshot.omega[1:-1, 1:-1])):.3f} s^-1")
+    if record.mode == "thermal" and isinstance(snapshot, ThermalFlowSnapshot):
+        cols[4].metric("Max Temperature", f"{np.max(snapshot.temperature):.2f} K")
+
+    st.progress(snapshot.time / max(record.config.final_time, 1.0e-12))
+    c1, c2, c3, c4 = st.columns([1.0, 1.0, 1.0, 4.0])
+    if c1.button("Prev Frame", use_container_width=True, disabled=st.session_state["frame_index"] == 0):
+        st.session_state["frame_index"] -= 1
+        st.rerun()
+    if c2.button("Next Frame", use_container_width=True, disabled=st.session_state["frame_index"] >= frame_max):
+        st.session_state["frame_index"] += 1
+        st.rerun()
+    if c3.button("Reset", use_container_width=True, disabled=st.session_state["frame_index"] == 0):
+        st.session_state["frame_index"] = 0
+        st.rerun()
+    c4.slider("Saved frame", 0, frame_max, key="frame_index")
+
+    views = ["Overview Fields", "Velocity and Pressure"] + (["Temperature Field"] if record.mode == "thermal" else [])
+    if st.session_state["view_name"] not in views:
+        st.session_state["view_name"] = views[0]
+    st.radio("Visualization", views, key="view_name", horizontal=True)
+    figure = build_overview_figure(record, st.session_state["frame_index"]) if st.session_state["view_name"] == "Overview Fields" else build_detail_figure(record, st.session_state["frame_index"]) if st.session_state["view_name"] == "Velocity and Pressure" else build_temperature_figure(record, st.session_state["frame_index"])
+    st.pyplot(figure, use_container_width=True)
+    st.download_button("Download current panel as PNG", data=figure_to_png(figure), file_name=f"cavity_{record.mode}_{st.session_state['view_name'].lower().replace(' ', '_')}_frame_{st.session_state['frame_index'] + 1:03d}.png", mime="image/png")
+
+    with st.expander("Transient history", expanded=True):
+        st.pyplot(build_history_figure(record, st.session_state["frame_index"]), use_container_width=True)
+    with st.expander("Field guide and governing equations", expanded=False):
+        st.markdown("The solver uses the streamfunction-vorticity form of incompressible flow, then reconstructs the velocity field from the streamfunction.")
+        st.latex(r"\nabla^2 \psi = -\omega")
+        st.latex(r"\frac{\partial \omega}{\partial t} + u \frac{\partial \omega}{\partial x} + v \frac{\partial \omega}{\partial y} = \nu \nabla^2 \omega")
+        st.latex(r"u = \frac{\partial \psi}{\partial y}, \qquad v = -\frac{\partial \psi}{\partial x}")
+        if record.mode == "thermal":
+            st.markdown("The thermal extension adds transient advection-diffusion with an optional volumetric source term.")
+            st.latex(r"\frac{\partial T}{\partial t} + u \frac{\partial T}{\partial x} + v \frac{\partial T}{\partial y} = \alpha \nabla^2 T + \frac{q'''}{\rho c_p}")
+
+
+def main() -> None:
+    st.set_page_config(page_title="Cavity Flow Teaching Studio", layout="wide", initial_sidebar_state="expanded")
+    init_state()
+    render_intro()
+    compute, status_box, summary_box, progress_bar = render_sidebar()
+
+    if compute:
         try:
-            x_preview = np.linspace(float(xmin), float(xmax), int(nx))
-            evaluate_initial_condition(expression, x_preview)
-            with st.spinner("Computing reference, non-conservative, and conservative solutions..."):
-                st.session_state.results = cached_build_results(
-                    float(xmin), float(xmax), int(nx), float(t_end), int(frames), float(cfl), expression, preset_name
-                )
+            mode, config = build_config()
+            with st.spinner("Running the cavity solver and preparing saved frames..."):
+                st.session_state["result"] = run_simulation(mode, config, status_box, summary_box, progress_bar)
+            st.session_state["frame_index"] = 0
+            st.success("Simulation finished. The saved frames are ready below.")
         except Exception as exc:
-            st.error(f"Computation failed: {exc}")
+            progress_bar.progress(0)
+            status_box.markdown("**Computation stopped.**")
+            summary_box.caption(str(exc))
+            st.error(str(exc))
 
-    results = st.session_state.get("results")
-    if results is None:
+    record = st.session_state.get("result")
+    if record is None:
+        status_box.markdown("**Ready.**")
+        summary_box.caption("No solution has been computed yet.")
         return
 
-    col1, col2 = st.columns([1.15, 0.85])
-    with col2:
-        st.subheader("Reference and errors")
-        st.write(f"**Reference mode:** {results['reference_label']}")
-        st.metric("Non-conservative L1", f"{results['metrics']['noncons_l1']:.4e}")
-        st.metric("Conservative L1", f"{results['metrics']['cons_l1']:.4e}")
-        st.write(
-            f"Non-conservative Linf = {results['metrics']['noncons_linf']:.4e}  \\\nConservative Linf = {results['metrics']['cons_linf']:.4e}"
-        )
-        frame_index = st.slider("Frame", min_value=0, max_value=len(results["times"]) - 1, value=0)
-        st.write(f"Time = {results['times'][frame_index]:.2f} / {results['times'][-1]:.2f}")
-
-    with col1:
-        fig = make_figure(results, frame_index)
-        st.pyplot(fig, use_container_width=True)
-        plt.close(fig)
-
-    with st.expander("Teaching note"):
-        st.write(
-            "This app compares non-conservative and conservative updates for the Burgers equation. "
-            "The top row shows the current snapshot against a reference solution, while the bottom row shows the space-time history up to the selected frame."
-        )
+    status_box.markdown("**Last solution loaded.**")
+    summary_box.caption(f"{len(record.snapshots)} frames available up to t = {record.snapshots[-1].time:.3f} s.")
+    progress_bar.progress(100)
+    render_results(record)
 
 
 if __name__ == "__main__":
